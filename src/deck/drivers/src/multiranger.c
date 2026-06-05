@@ -58,6 +58,22 @@ NO_DMA_CCM_SAFE_ZERO_INIT static VL53L1_Dev_t devUp;
 NO_DMA_CCM_SAFE_ZERO_INIT static VL53L1_Dev_t devLeft;
 NO_DMA_CCM_SAFE_ZERO_INIT static VL53L1_Dev_t devRight;
 
+// Per-beam VL53L1x return quality, captured from the ranging struct we already read
+// every cycle (only RangeMilliMeter was kept before; the rest was discarded). These
+// let the off-board fusion filter weight each beam by measured photon statistics
+// (sigma, signal rate, ambient, status) instead of a geometric proxy, and recover the
+// UNcensored range for grazing/oblique hits that range.* replaces with the 32767
+// sentinel. Ranging config is untouched -- this only publishes discarded data.
+typedef struct {
+  float sigma;     // SigmaMilliMeter (mm): sensor's own range-std estimate
+  float signal;    // SignalRateRtnMegaCps (MCPS): return strength / reflectance x geom
+  float ambient;   // AmbientRateRtnMegaCps (MCPS): background light (for SNR)
+  int16_t range;   // RangeMilliMeter (mm): UNcensored (range.* applies filterMask)
+  uint8_t status;  // RangeStatus: 0=valid, else sigma/signal/wrap fail
+} mrQuality_t;
+
+static mrQuality_t qFront, qBack, qUp, qLeft, qRight;
+
 static bool mrInitSensor(VL53L1_Dev_t *pdev, uint32_t pca95pin, char *name)
 {
     bool status;
@@ -81,7 +97,7 @@ static bool mrInitSensor(VL53L1_Dev_t *pdev, uint32_t pca95pin, char *name)
     return status;
 }
 
-static uint16_t mrGetMeasurementAndRestart(VL53L1_Dev_t *dev)
+static uint16_t mrGetMeasurementAndRestart(VL53L1_Dev_t *dev, mrQuality_t *q)
 {
     VL53L1_Error status = VL53L1_ERROR_NONE;
     VL53L1_RangingMeasurementData_t rangingData;
@@ -95,6 +111,14 @@ static uint16_t mrGetMeasurementAndRestart(VL53L1_Dev_t *dev)
     }
 
     status = VL53L1_GetRangingMeasurementData(dev, &rangingData);
+
+    // Publish the return quality we would otherwise throw away (FixPoint16.16 -> float).
+    // raw range is UNcensored so the filter can still use sigma-/signal-fail hits.
+    q->sigma = rangingData.SigmaMilliMeter / 65536.0f;
+    q->signal = rangingData.SignalRateRtnMegaCps / 65536.0f;
+    q->ambient = rangingData.AmbientRateRtnMegaCps / 65536.0f;
+    q->range = rangingData.RangeMilliMeter;
+    q->status = rangingData.RangeStatus;
 
     if (filterMask & (1 << rangingData.RangeStatus))
     {
@@ -136,11 +160,11 @@ static void mrTask(void *param)
     while (1)
     {
         vTaskDelayUntil(&lastWakeTime, M2T(100));
-        rangeSet(rangeFront, mrGetMeasurementAndRestart(&devFront) / 1000.0f);
-        rangeSet(rangeBack, mrGetMeasurementAndRestart(&devBack) / 1000.0f);
-        rangeSet(rangeUp, mrGetMeasurementAndRestart(&devUp) / 1000.0f);
-        rangeSet(rangeLeft, mrGetMeasurementAndRestart(&devLeft) / 1000.0f);
-        rangeSet(rangeRight, mrGetMeasurementAndRestart(&devRight) / 1000.0f);
+        rangeSet(rangeFront, mrGetMeasurementAndRestart(&devFront, &qFront) / 1000.0f);
+        rangeSet(rangeBack, mrGetMeasurementAndRestart(&devBack, &qBack) / 1000.0f);
+        rangeSet(rangeUp, mrGetMeasurementAndRestart(&devUp, &qUp) / 1000.0f);
+        rangeSet(rangeLeft, mrGetMeasurementAndRestart(&devLeft, &qLeft) / 1000.0f);
+        rangeSet(rangeRight, mrGetMeasurementAndRestart(&devRight, &qRight) / 1000.0f);
     }
 }
 
@@ -223,3 +247,33 @@ PARAM_GROUP_START(multiranger)
 PARAM_ADD(PARAM_UINT16, filterMask, &filterMask)
 
 PARAM_GROUP_STOP(multiranger)
+
+/**
+ * Per-beam VL53L1x return quality (front/back/left/right), sourced from the same
+ * ranging struct as range.* but NOT censored by filterMask: 'raw*' carries the
+ * grazing/oblique range that range.* drops to 32767. Lets the off-board fusion
+ * filter weight each beam by measured photon statistics (sigma/signal/ambient/
+ * status) instead of a geometric tilt/yaw proxy. Updated at the 10 Hz sensor rate.
+ */
+LOG_GROUP_START(mrq)
+LOG_ADD(LOG_FLOAT, sigmaF, &qFront.sigma)
+LOG_ADD(LOG_FLOAT, sigmaB, &qBack.sigma)
+LOG_ADD(LOG_FLOAT, sigmaL, &qLeft.sigma)
+LOG_ADD(LOG_FLOAT, sigmaR, &qRight.sigma)
+LOG_ADD(LOG_FLOAT, signalF, &qFront.signal)
+LOG_ADD(LOG_FLOAT, signalB, &qBack.signal)
+LOG_ADD(LOG_FLOAT, signalL, &qLeft.signal)
+LOG_ADD(LOG_FLOAT, signalR, &qRight.signal)
+LOG_ADD(LOG_FLOAT, ambientF, &qFront.ambient)
+LOG_ADD(LOG_FLOAT, ambientB, &qBack.ambient)
+LOG_ADD(LOG_FLOAT, ambientL, &qLeft.ambient)
+LOG_ADD(LOG_FLOAT, ambientR, &qRight.ambient)
+LOG_ADD(LOG_INT16, rawF, &qFront.range)
+LOG_ADD(LOG_INT16, rawB, &qBack.range)
+LOG_ADD(LOG_INT16, rawL, &qLeft.range)
+LOG_ADD(LOG_INT16, rawR, &qRight.range)
+LOG_ADD(LOG_UINT8, statusF, &qFront.status)
+LOG_ADD(LOG_UINT8, statusB, &qBack.status)
+LOG_ADD(LOG_UINT8, statusL, &qLeft.status)
+LOG_ADD(LOG_UINT8, statusR, &qRight.status)
+LOG_GROUP_STOP(mrq)
