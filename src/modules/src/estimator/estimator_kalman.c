@@ -93,6 +93,7 @@
 #include "mm_tof_rate.h"
 #include "mm_tof_surface.h"
 #include "mm_tof_walls.h"
+#include "mm_zupt.h"
 #include "mm_yaw_error.h"
 #include "mm_sweep_angles.h"
 
@@ -250,6 +251,14 @@ static void kalmanTask(void* parameters) {
 
       kalmanCorePredict(&coreData, &coreParams, &accSubSampler.subSample, &gyroSubSampler.subSample, nowMs, quadIsFlying);
       nextPredictionMs = nowMs + PREDICTION_UPDATE_INTERVAL_MS;
+
+      // ZUPT: on the ground the craft is stationary, so pin body lateral velocity to 0. This
+      // cancels the accel-bias drift the on-ground predict just integrated -- the continuous,
+      // timing-independent replacement for the pre-climb estimator reset (and it holds X/Y at the
+      // origin so the wall references seed clean at takeoff). Only runs while NOT flying.
+      if (!quadIsFlying) {
+        kalmanCoreUpdateWithZupt(&coreData);
+      }
 
       STATS_CNT_RATE_EVENT(&predictionCounter);
 
