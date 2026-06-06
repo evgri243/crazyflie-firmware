@@ -76,6 +76,30 @@ static bool useAdaptiveStd = false;
 // (will not work if useAdaptiveStd is on)
 static float flowStdFixed = 2.0f;
 
+// --- Light-aware flow std (honest R_flow) ---
+// The PMW3901 BLINDS in the dark: it stops reporting ~0 and starts emitting GARBAGE motion spikes
+// (flight 190829: deltaX/Y jumped to 8-26 px at squal 11 / contrast 7, driving vy to ~1 m/s). The
+// fixed std fused that garbage straight into velocity. So ramp the flow std from base (good light)
+// toward stdBlind (effectively ignore flow) as the sensor's OWN quality collapses -- keyed on squal
+// (lock confidence) AND contrast = maxRawData - minRawData (texture/light), the cleaner blindness
+// signals than shutter (which saturates at 8191). Anchors re-calibrated against real hover logs (see
+// the static block below): trustworthy at squal>=20 / contrast>=60, blind at squal<=12 / contrast<=15.
+// Default on; this is the flow's honest variance, so the EKF self-down-weights blind flow only when
+// the sensor is truly near the garbage band, and the walls + accel carry velocity there.
+static uint8_t useQualityStd = 1;        // 1 -> squal+contrast ramp (default); else adaptive/fixed
+// Calibrated against real hover logs: in NORMAL flight this deck reads squal 18-42 (median ~28) --
+// that is healthy flow, NOT blindness. The dark GARBAGE case (flight 190829) was squal 11-14. The
+// first ramp (good=60/floor=15) put normal flight mid-ramp and downweighted ~7x for the WHOLE hover,
+// softening velocity damping enough to let the craft drift (then the legacy wall refs follow it).
+// So the ramp now trusts the normal range fully and only fades as squal approaches the garbage band.
+// The Student-t robust weight (flowrob, mm_flow.c) stays the real catcher for transient dark spikes,
+// so a gentle std ramp loses no dark protection.
+static float flowSqualGood = 20.0f;      // squal at/above which flow is fully trusted (normal flight 18-42)
+static float flowSqualFloor = 12.0f;     // squal at/below which flow is blind (garbage band ~11-14)
+static float flowContrastGood = 60.0f;   // (maxRaw-minRaw) at/above which flow is fully trusted (sweep: dim~50, bright~180)
+static float flowContrastFloor = 15.0f;  // (maxRaw-minRaw) at/below which flow is blind (dark~7)
+static float flowStdBlind = 20.0f;       // flow std when fully blind (effective ~2 m/s -> ignored)
+
 #define NCS_PIN DECK_GPIO_IO3
 
 
@@ -97,17 +121,28 @@ static void flowdeckTask(void *param)
     // Outlier removal
     if (abs(accpx) < OULIER_LIMIT && abs(accpy) < OULIER_LIMIT) {
 
-    if (useAdaptiveStd)
+    if (useQualityStd)
+    {
+      // Honest R_flow: ramp the std from base (flowStdFixed) toward flowStdBlind as the sensor
+      // quality collapses, so blind flow (which spikes garbage in the dark) self-down-weights to
+      // nothing. squalScore/contrastScore each ramp 1->0 over good->floor; the WORST one dominates
+      // (min) -- either signal saying "blind" suffices. q=1 -> base, q=0 -> blind.
+      float squalScore = ((float)currentMotion.squal - flowSqualFloor) / (flowSqualGood - flowSqualFloor);
+      float contrast = (float)currentMotion.maxRawData - (float)currentMotion.minRawData;
+      float contrastScore = (contrast - flowContrastFloor) / (flowContrastGood - flowContrastFloor);
+      if (squalScore < 0.0f) { squalScore = 0.0f; }
+      if (squalScore > 1.0f) { squalScore = 1.0f; }
+      if (contrastScore < 0.0f) { contrastScore = 0.0f; }
+      if (contrastScore > 1.0f) { contrastScore = 1.0f; }
+      float q = (squalScore < contrastScore) ? squalScore : contrastScore;
+      stdFlow = flowStdFixed + (flowStdBlind - flowStdFixed) * (1.0f - q);
+    }
+    else if (useAdaptiveStd)
     {
       // The standard deviation is fitted by measurements flying over low and high texture
       //   and looking at the shutter time
       float shutter_f = (float)currentMotion.shutter;
       stdFlow=0.0007984f *shutter_f + 0.4335f;
-
-
-      // The formula with the amount of features instead
-      /*float squal_f = (float)currentMotion.squal;
-      stdFlow =  -0.01257f * squal_f + 4.406f; */
       if (stdFlow < 0.1f) stdFlow=0.1f;
     } else {
       stdFlow = flowStdFixed;
@@ -319,6 +354,16 @@ PARAM_ADD(PARAM_UINT8, adaptive, &useAdaptiveStd)
  * @brief Set standard deviation flow measurement (default: 2.0f)
  */
 PARAM_ADD_CORE(PARAM_FLOAT | PARAM_PERSISTENT, flowStdFixed, &flowStdFixed)
+/**
+ * @brief 1 = light-aware flow std: ramp base->blind as squal/contrast collapse (honest R_flow,
+ * default). Takes precedence over `adaptive`. 0 = use adaptive(shutter)/fixed.
+ */
+PARAM_ADD(PARAM_UINT8, qualityStd, &useQualityStd)
+PARAM_ADD(PARAM_FLOAT, squalGood, &flowSqualGood)
+PARAM_ADD(PARAM_FLOAT, squalFloor, &flowSqualFloor)
+PARAM_ADD(PARAM_FLOAT, contrastGood, &flowContrastGood)
+PARAM_ADD(PARAM_FLOAT, contrastFloor, &flowContrastFloor)
+PARAM_ADD(PARAM_FLOAT, stdBlind, &flowStdBlind)
 PARAM_GROUP_STOP(motion)
 
 PARAM_GROUP_START(deck)

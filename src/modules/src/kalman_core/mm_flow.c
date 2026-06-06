@@ -27,8 +27,19 @@
 #include "log.h"
 #include "platform_defaults.h"
 #include "param.h"
+#include <math.h>
 
 #define FLOW_RESOLUTION 0.10f //We get the measurements in 10x the motion pixels (experimentally measured)
+
+// Student-t robust weight on the flow update. The PMW3901 emits transient GARBAGE motion spikes
+// when it blinds in the dark (flight 190829: deltaX/Y -> 8-26 px, driving vy to ~1 m/s); the
+// light-aware std (flowdeck_v1v2.c) raises the nominal std, but a big transient spike can still
+// leak through. This rejects it the gate-free way -- the same Student-t robust weight the wall /
+// surface fusion uses: w = (nu+1)/(nu + innov^2/S), R inflated by 1/clip(w, wMin, 1). Normal flow
+// (small innovation) -> w~1, untouched; a dark spike -> huge innovation -> w->wMin, rejected.
+static uint8_t flowRobust = 1;   // 1 = Student-t robust weight on the flow update (default on)
+static float flowNu = 5.0f;      // Student-t dof (flow_dof): heavy tails -> soft outlier rejection
+static float flowWMin = 0.001f;  // robust weight floor: max R inflation = 1/wMin
 
 // TODO remove the temporary test variables (used for logging)
 static float predictedNX;
@@ -37,6 +48,30 @@ static float measuredNX;
 static float measuredNY;
 
 static Axis3f flowdeckPos = { .axis = { FLOWDECK_POS_X, FLOWDECK_POS_Y, FLOWDECK_POS_Z } }; // In body coordinate system
+
+// Inflation factor 1/sqrt(w) for the flow measurement std, from the Student-t robust weight.
+// The flow H is sparse (only KC_STATE_Z and the velocity axis velIdx are non-zero), so the
+// innovation variance S = H P H' + R is the 2-term quadratic below. Returns 1.0 when disabled or
+// degenerate (no change to the stock update).
+static float flowRobustStdScale(const kalmanCoreData_t* this, const float* h, int velIdx,
+                                float std, float innov)
+{
+  if (!flowRobust) {
+    return 1.0f;
+  }
+  float R = std * std;
+  float S = h[KC_STATE_Z]  * h[KC_STATE_Z]  * this->P[KC_STATE_Z][KC_STATE_Z]
+          + 2.0f * h[KC_STATE_Z] * h[velIdx] * this->P[KC_STATE_Z][velIdx]
+          + h[velIdx] * h[velIdx] * this->P[velIdx][velIdx]
+          + R;
+  if (!(S > 0.0f)) {
+    return 1.0f;
+  }
+  float w = (flowNu + 1.0f) / (flowNu + innov * innov / S);
+  if (w > 1.0f) { w = 1.0f; }
+  if (w < flowWMin) { w = flowWMin; }
+  return 1.0f / sqrtf(w);  // R_eff = R/w  =>  std_eff = std / sqrt(w)
+}
 
 void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *flow, const Axis3f *gyro)
 {
@@ -87,8 +122,10 @@ void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *f
   hx[KC_STATE_Z]  = (Npix * flow->dt / thetapix) * ((this->R[2][2] * v_cam_bx) / (-z_g * z_g));
   hx[KC_STATE_PX] = (Npix * flow->dt / thetapix) * (this->R[2][2] / z_g);
 
-  //First update
-  kalmanCoreScalarUpdate(this, &Hx, (measuredNX-predictedNX), flow->stdDevX*FLOW_RESOLUTION);
+  //First update (robust: a dark garbage spike is rejected via the Student-t weight)
+  float innovNX = measuredNX - predictedNX;
+  float stdNX = flow->stdDevX * FLOW_RESOLUTION;
+  kalmanCoreScalarUpdate(this, &Hx, innovNX, stdNX * flowRobustStdScale(this, hx, KC_STATE_PX, stdNX, innovNX));
 
   // Y velocity prediction and update
   float hy[KC_STATE_DIM] = {0};
@@ -100,8 +137,10 @@ void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *f
   hy[KC_STATE_Z]  = (Npix * flow->dt / thetapix) * ((this->R[2][2] * v_cam_by) / (-z_g * z_g));
   hy[KC_STATE_PY] = (Npix * flow->dt / thetapix) * (this->R[2][2] / z_g);
 
-  // Second update
-  kalmanCoreScalarUpdate(this, &Hy, (measuredNY-predictedNY), flow->stdDevY*FLOW_RESOLUTION);
+  // Second update (robust)
+  float innovNY = measuredNY - predictedNY;
+  float stdNY = flow->stdDevY * FLOW_RESOLUTION;
+  kalmanCoreScalarUpdate(this, &Hy, innovNY, stdNY * flowRobustStdScale(this, hy, KC_STATE_PY, stdNY, innovNY));
 }
 
 /**
@@ -152,3 +191,21 @@ PARAM_GROUP_START(flowdeck)
    */
   PARAM_ADD_CORE(PARAM_FLOAT | PARAM_PERSISTENT, flowdeckPos_z, &flowdeckPos.z)
 PARAM_GROUP_STOP(flowdeck)
+
+/**
+ * Flow update robustness: Student-t weight that rejects the PMW3901's dark garbage spikes.
+ */
+PARAM_GROUP_START(flowrob)
+/**
+ * @brief 1 = Student-t robust weight on the flow update (default), 0 = plain update.
+ */
+PARAM_ADD(PARAM_UINT8, enable, &flowRobust)
+/**
+ * @brief Student-t degrees of freedom: lower => softer rejection of a large flow innovation.
+ */
+PARAM_ADD(PARAM_FLOAT, nu, &flowNu)
+/**
+ * @brief Robust weight floor: the most the flow R can be inflated is 1/wMin.
+ */
+PARAM_ADD(PARAM_FLOAT, wMin, &flowWMin)
+PARAM_GROUP_STOP(flowrob)
