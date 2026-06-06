@@ -49,7 +49,6 @@ typedef enum {
   MeasurementTypePose,
   MeasurementTypeDistance,
   MeasurementTypeTOF,
-  MeasurementTypeTOFRate,
   MeasurementTypeTOFSurfaceDown,
   MeasurementTypeTOFSurfaceUp,
   MeasurementTypeWallFront,
@@ -133,16 +132,6 @@ static inline void estimatorEnqueueTOF(const tofMeasurement_t *tof)
   measurement_t m;
   m.type = MeasurementTypeTOF;
   m.data.tof = *tof;
-  estimatorEnqueue(&m);
-}
-
-// Down-ranger RANGE-RATE -> vertical velocity (furniture-immune fast damping). Reuses the
-// tofMeasurement_t carrier: .distance holds the rate [m/s], .stdDev its std.
-static inline void estimatorEnqueueTOFRate(const tofMeasurement_t *tofRate)
-{
-  measurement_t m;
-  m.type = MeasurementTypeTOFRate;
-  m.data.tof = *tofRate;
   estimatorEnqueue(&m);
 }
 

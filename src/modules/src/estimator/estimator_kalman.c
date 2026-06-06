@@ -90,7 +90,6 @@
 #include "mm_tdoa.h"
 #include "mm_flow.h"
 #include "mm_tof.h"
-#include "mm_tof_rate.h"
 #include "mm_tof_surface.h"
 #include "mm_tof_walls.h"
 #include "mm_zupt.h"
@@ -346,9 +345,6 @@ static void updateQueuedMeasurements(const uint32_t nowMs, const bool quadIsFlyi
         break;
       case MeasurementTypeTOF:
         kalmanCoreUpdateWithTof(&coreData, &m.data.tof);
-        break;
-      case MeasurementTypeTOFRate:
-        kalmanCoreUpdateWithTofRate(&coreData, &m.data.tof);
         break;
       case MeasurementTypeTOFSurfaceDown:
         // DOWN beam (zranger) opposing-surface height fusion (mm_tof_surface, gate-free Student-t).
