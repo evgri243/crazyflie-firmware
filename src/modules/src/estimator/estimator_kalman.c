@@ -92,6 +92,7 @@
 #include "mm_tof.h"
 #include "mm_tof_rate.h"
 #include "mm_tof_surface.h"
+#include "mm_tof_walls.h"
 #include "mm_yaw_error.h"
 #include "mm_sweep_angles.h"
 
@@ -348,6 +349,22 @@ static void updateQueuedMeasurements(const uint32_t nowMs, const bool quadIsFlyi
         // UP beam (multiranger up) opposing-surface height fusion (mm_tof_surface).
         kalmanCoreUpdateWithTofUp(&coreData, &m.data.tof, quadIsFlying);
         break;
+      case MeasurementTypeWallFront:
+        // FRONT beam (multiranger) wall absolute-position fusion -> world X (mm_tof_walls).
+        kalmanCoreUpdateWithWallFront(&coreData, &m.data.tof, quadIsFlying);
+        break;
+      case MeasurementTypeWallBack:
+        // BACK beam (multiranger) wall absolute-position fusion -> world X (mm_tof_walls).
+        kalmanCoreUpdateWithWallBack(&coreData, &m.data.tof, quadIsFlying);
+        break;
+      case MeasurementTypeWallLeft:
+        // LEFT beam (multiranger) wall absolute-position fusion -> world Y (mm_tof_walls).
+        kalmanCoreUpdateWithWallLeft(&coreData, &m.data.tof, quadIsFlying);
+        break;
+      case MeasurementTypeWallRight:
+        // RIGHT beam (multiranger) wall absolute-position fusion -> world Y (mm_tof_walls).
+        kalmanCoreUpdateWithWallRight(&coreData, &m.data.tof, quadIsFlying);
+        break;
       case MeasurementTypeAbsoluteHeight:
         kalmanCoreUpdateWithAbsoluteHeight(&coreData, &m.data.height);
         break;
@@ -400,6 +417,9 @@ void estimatorKalmanInit(void)
 
   uint32_t nowMs = T2M(xTaskGetTickCount());
   kalmanCoreInit(&coreData, &coreParams, nowMs);
+  // Clear the module-static wall references so each flight re-seeds fresh (they persist across
+  // flights and would otherwise carry a prior flight's re-seated box/hand reference into the next).
+  kalmanCoreWallReset();
 }
 
 bool estimatorKalmanTest(void)

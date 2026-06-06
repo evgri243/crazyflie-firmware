@@ -11,4 +11,5 @@ obj-y += mm_tdoa_robust.o
 obj-y += mm_tof.o
 obj-y += mm_tof_rate.o
 obj-y += mm_tof_surface.o
+obj-y += mm_tof_walls.o
 obj-y += mm_yaw_error.o

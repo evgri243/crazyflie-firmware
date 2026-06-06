@@ -52,6 +52,10 @@ typedef enum {
   MeasurementTypeTOFRate,
   MeasurementTypeTOFSurfaceDown,
   MeasurementTypeTOFSurfaceUp,
+  MeasurementTypeWallFront,
+  MeasurementTypeWallBack,
+  MeasurementTypeWallLeft,
+  MeasurementTypeWallRight,
   MeasurementTypeAbsoluteHeight,
   MeasurementTypeFlow,
   MeasurementTypeYawError,
@@ -158,6 +162,42 @@ static inline void estimatorEnqueueTOFSurfaceUp(const tofMeasurement_t *tof)
 {
   measurement_t m;
   m.type = MeasurementTypeTOFSurfaceUp;
+  m.data.tof = *tof;
+  estimatorEnqueue(&m);
+}
+
+// Horizontal wall beams (multiranger front/back/left/right) -> wall absolute-position fusion
+// (mm_tof_walls). .distance = beam slant range [m], .stdDev = per-shot VL53L1x sigma [m]. front/back
+// anchor world X, left/right anchor world Y; each wall reference self-calibrates (a box re-seats it).
+// Reuse the tof union member (no struct growth), exactly like the TOFSurfaceDown/Up helpers.
+static inline void estimatorEnqueueWallFront(const tofMeasurement_t *tof)
+{
+  measurement_t m;
+  m.type = MeasurementTypeWallFront;
+  m.data.tof = *tof;
+  estimatorEnqueue(&m);
+}
+
+static inline void estimatorEnqueueWallBack(const tofMeasurement_t *tof)
+{
+  measurement_t m;
+  m.type = MeasurementTypeWallBack;
+  m.data.tof = *tof;
+  estimatorEnqueue(&m);
+}
+
+static inline void estimatorEnqueueWallLeft(const tofMeasurement_t *tof)
+{
+  measurement_t m;
+  m.type = MeasurementTypeWallLeft;
+  m.data.tof = *tof;
+  estimatorEnqueue(&m);
+}
+
+static inline void estimatorEnqueueWallRight(const tofMeasurement_t *tof)
+{
+  measurement_t m;
+  m.type = MeasurementTypeWallRight;
   m.data.tof = *tof;
   estimatorEnqueue(&m);
 }

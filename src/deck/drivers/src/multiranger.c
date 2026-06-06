@@ -54,6 +54,14 @@ static uint8_t mrUpFuse = 0;
 static float mrUpStd = 0.05f;       // [m] fallback up-beam height std (used when no per-shot sigma)
 #define MR_CEILING_OUTLIER_MM 5000  // reject >5 m / the 32767 censored sentinel
 
+// Fuse the horizontal beams (front/back/left/right) into the estimator as the wall
+// absolute-position anchor (mm_tof_walls). Default 0 = stock (log-only). Only valid returns within
+// MR_CEILING_OUTLIER_MM are enqueued, so a wall out of range / a missing return simply feeds nothing
+// (a room with only 2-3 walls in range still anchors each axis from whatever wall is present).
+// Independent of mrUp.fuse (height) -- this owns horizontal X/Y.
+static uint8_t mrWallsFuse = 0;
+static float mrWallsStd = 0.02f;    // [m] fallback wall-range std (used when no per-shot sigma)
+
 #define MR_PIN_UP PCA95X4_P0
 #define MR_PIN_FRONT PCA95X4_P4
 #define MR_PIN_BACK PCA95X4_P1
@@ -168,8 +176,28 @@ static void mrTask(void *param)
     while (1)
     {
         vTaskDelayUntil(&lastWakeTime, M2T(100));
-        rangeSet(rangeFront, mrGetMeasurementAndRestart(&devFront, &qFront) / 1000.0f);
-        rangeSet(rangeBack, mrGetMeasurementAndRestart(&devBack, &qBack) / 1000.0f);
+        uint16_t frontMm = mrGetMeasurementAndRestart(&devFront, &qFront);
+        rangeSet(rangeFront, frontMm / 1000.0f);
+        // Wall FRONT-beam anchor: feed a VALID front return to the estimator (mm_tof_walls -> X).
+        // Same heteroscedastic pattern as the up beam: pass the per-shot VL53L1x sigma [m] as stdDev
+        // so the handler trusts a clean return and self-weakens a far / grazing one. mrWallsStd is
+        // the fallback when the sensor reports no sigma.
+        if (mrWallsFuse != 0 && frontMm < MR_CEILING_OUTLIER_MM) {
+          tofMeasurement_t front;
+          front.timestamp = xTaskGetTickCount();
+          front.distance = frontMm / 1000.0f;
+          front.stdDev = (qFront.sigma > 0.0f) ? (qFront.sigma * 0.001f) : mrWallsStd;
+          estimatorEnqueueWallFront(&front);
+        }
+        uint16_t backMm = mrGetMeasurementAndRestart(&devBack, &qBack);
+        rangeSet(rangeBack, backMm / 1000.0f);
+        if (mrWallsFuse != 0 && backMm < MR_CEILING_OUTLIER_MM) {
+          tofMeasurement_t back;
+          back.timestamp = xTaskGetTickCount();
+          back.distance = backMm / 1000.0f;
+          back.stdDev = (qBack.sigma > 0.0f) ? (qBack.sigma * 0.001f) : mrWallsStd;
+          estimatorEnqueueWallBack(&back);
+        }
         uint16_t upMm = mrGetMeasurementAndRestart(&devUp, &qUp);
         rangeSet(rangeUp, upMm / 1000.0f);
         // Opposing-surface UP-beam anchor: feed a VALID up return to the estimator (mm_tof_surface).
@@ -183,8 +211,25 @@ static void mrTask(void *param)
           up.stdDev = (qUp.sigma > 0.0f) ? (qUp.sigma * 0.001f) : mrUpStd; // qUp.sigma is [mm]
           estimatorEnqueueTOFSurfaceUp(&up);
         }
-        rangeSet(rangeLeft, mrGetMeasurementAndRestart(&devLeft, &qLeft) / 1000.0f);
-        rangeSet(rangeRight, mrGetMeasurementAndRestart(&devRight, &qRight) / 1000.0f);
+        uint16_t leftMm = mrGetMeasurementAndRestart(&devLeft, &qLeft);
+        rangeSet(rangeLeft, leftMm / 1000.0f);
+        // Wall LEFT-beam anchor: feed a VALID left return to the estimator (mm_tof_walls -> Y).
+        if (mrWallsFuse != 0 && leftMm < MR_CEILING_OUTLIER_MM) {
+          tofMeasurement_t left;
+          left.timestamp = xTaskGetTickCount();
+          left.distance = leftMm / 1000.0f;
+          left.stdDev = (qLeft.sigma > 0.0f) ? (qLeft.sigma * 0.001f) : mrWallsStd;
+          estimatorEnqueueWallLeft(&left);
+        }
+        uint16_t rightMm = mrGetMeasurementAndRestart(&devRight, &qRight);
+        rangeSet(rangeRight, rightMm / 1000.0f);
+        if (mrWallsFuse != 0 && rightMm < MR_CEILING_OUTLIER_MM) {
+          tofMeasurement_t right;
+          right.timestamp = xTaskGetTickCount();
+          right.distance = rightMm / 1000.0f;
+          right.stdDev = (qRight.sigma > 0.0f) ? (qRight.sigma * 0.001f) : mrWallsStd;
+          estimatorEnqueueWallRight(&right);
+        }
     }
 }
 
@@ -283,6 +328,23 @@ PARAM_ADD(PARAM_UINT8, fuse, &mrUpFuse)
  */
 PARAM_ADD(PARAM_FLOAT, std, &mrUpStd)
 PARAM_GROUP_STOP(mrUp)
+
+/**
+ * Wall absolute-position: feed the horizontal beams (front/back/left/right) to the estimator
+ * (mm_tof_walls). front/back anchor world X, left/right anchor world Y.
+ */
+PARAM_GROUP_START(mrWalls)
+/**
+ * @brief 1 = fuse the four horizontal beams as the wall absolute-position anchor (mm_tof_walls),
+ * 0 = stock (log-only). The wall references self-calibrate (a box pushed to a wall re-seats its
+ * reference, X/Y hold), exactly as a table re-seats the down-surface height reference.
+ */
+PARAM_ADD(PARAM_UINT8, fuse, &mrWallsFuse)
+/**
+ * @brief Fallback wall-range measurement std [m] when the sensor reports no per-shot sigma.
+ */
+PARAM_ADD(PARAM_FLOAT, std, &mrWallsStd)
+PARAM_GROUP_STOP(mrWalls)
 
 /**
  * Per-beam VL53L1x return quality (front/back/left/right), sourced from the same
