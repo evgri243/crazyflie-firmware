@@ -51,6 +51,14 @@ static const float expPointB = 4.0f;
 static const float expStdB = 0.2f;    // STD at elevation expPointB [m]
 static float expCoeff;
 
+// Runtime deweight of the onboard down-range fusion (analog of motion.flowStdFixed).
+// 0 (default) => use the expStd model above (stock behaviour). >0 => OVERRIDE the enqueued
+// std with this fixed value [m], so the onboard EKF barely trusts the raw down beam. This
+// hands height authority to an external z (cf.extpos.send_extpos) for furniture-robust Z:
+// a table sliding under steps the raw down beam to a tight ~2.5 mm-std reading that would
+// otherwise weld stateEstimate.z to it (~400x our extpos trust) and drive the craft up.
+static float downStdFixed = 0.0f;
+
 #define RANGE_OUTLIER_LIMIT 5000 // the measured range is in [mm]
 
 static uint16_t range_last = 0;
@@ -160,6 +168,9 @@ void zRanger2Task(void* arg)
     if (range_last < RANGE_OUTLIER_LIMIT) {
       float distance = (float)range_last * 0.001f; // Scale from [mm] to [m]
       float stdDev = expStdA * (1.0f  + expf( expCoeff * (distance - expPointA)));
+      if (downStdFixed > 0.0f) {
+        stdDev = downStdFixed;  // runtime deweight: hand height authority to extpos-z
+      }
       rangeEnqueueDownRangeInEstimator(distance, stdDev, xTaskGetTickCount());
     }
   }
@@ -186,6 +197,20 @@ PARAM_GROUP_START(deck)
 PARAM_ADD_CORE(PARAM_UINT8 | PARAM_RONLY, bcZRanger2, &isInit)
 
 PARAM_GROUP_STOP(deck)
+
+/**
+ * Down (floor) z-ranger fusion tuning.
+ */
+PARAM_GROUP_START(zrange)
+
+/**
+ * @brief Fixed override [m] for the down-range measurement std fed to the EKF. 0 (default) =
+ * use the built-in distance-dependent expStd model; >0 = deweight the onboard down beam so an
+ * external z (cf.extpos.send_extpos) owns height (furniture-robust Z). Analog of motion.flowStdFixed.
+ */
+PARAM_ADD(PARAM_FLOAT, stdFixed, &downStdFixed)
+
+PARAM_GROUP_STOP(zrange)
 
 /**
  * Floor (down VL53L1x) return quality, sourced from the same ranging struct as
