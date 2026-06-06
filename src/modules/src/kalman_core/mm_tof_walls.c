@@ -80,7 +80,12 @@ static float wallJumpCouple  = 0.5f;    // abs_jump_couple: fraction of jumpSize
 static float wallJumpSizeM   = 0.35f;   // abs_jump_size_m: wall-swap step scale [m]
 static float wallAVarMaxM2   = 0.25f;   // abs_a_var_max_m2: cap on a reference's variance [m^2]
 static float wallReseatWMax  = 0.40f;   // reseat_w_max: only re-seat below this w (a clear swap)
-static float wallRwStd       = 0.10f;   // per-wall reference random-walk std [m/sqrt(s)]
+static float wallRwStd       = 0.01f;   // per-wall reference random-walk std [m/sqrt(s)]
+// ^ Honest static-wall prior. 0.10 asserted the wall wanders ~10 cm/s, which let the reference CHASE
+//   the craft on a smooth translation (Kref ~0.83/step) -- the residual diagonal drift. A wall does
+//   not move; its genuine slow change (sub-degree yaw bias, mount creep) is ~mm/s, so 0.01 (Kref
+//   ~0.18). Sensor noise still lives in R (per-shot sigma + sigModel + tilt/floor inflation); a box
+//   still re-seats via the Student-t jump (var injected up to aVarMax), independent of rw.
 static float wallInitVarM2   = 0.01f;   // init_ref_std_m^2: reference variance at (re)seed [m^2]
 static float wallTiltRScaleDeg = 20.0f; // tilt_r_scale_deg: yaw/tilt R-inflation scale [deg]
 // ray-cast wall-vs-floor model (fusion/sensors.py rangeabs_update)
