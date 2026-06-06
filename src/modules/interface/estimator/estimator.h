@@ -49,6 +49,9 @@ typedef enum {
   MeasurementTypePose,
   MeasurementTypeDistance,
   MeasurementTypeTOF,
+  MeasurementTypeTOFRate,
+  MeasurementTypeTOFSurfaceDown,
+  MeasurementTypeTOFSurfaceUp,
   MeasurementTypeAbsoluteHeight,
   MeasurementTypeFlow,
   MeasurementTypeYawError,
@@ -125,6 +128,36 @@ static inline void estimatorEnqueueTOF(const tofMeasurement_t *tof)
 {
   measurement_t m;
   m.type = MeasurementTypeTOF;
+  m.data.tof = *tof;
+  estimatorEnqueue(&m);
+}
+
+// Down-ranger RANGE-RATE -> vertical velocity (furniture-immune fast damping). Reuses the
+// tofMeasurement_t carrier: .distance holds the rate [m/s], .stdDev its std.
+static inline void estimatorEnqueueTOFRate(const tofMeasurement_t *tofRate)
+{
+  measurement_t m;
+  m.type = MeasurementTypeTOFRate;
+  m.data.tof = *tofRate;
+  estimatorEnqueue(&m);
+}
+
+// DOWN beam (zranger) -> opposing-surface height fusion (mm_tof_surface). .distance = down range
+// [m], .stdDev = per-shot VL53L1x sigma [m]. The down reference self-calibrates (a table re-seats it).
+static inline void estimatorEnqueueTOFSurfaceDown(const tofMeasurement_t *tof)
+{
+  measurement_t m;
+  m.type = MeasurementTypeTOFSurfaceDown;
+  m.data.tof = *tof;
+  estimatorEnqueue(&m);
+}
+
+// UP beam (multiranger up) -> opposing-surface height fusion (mm_tof_surface). .distance = up range
+// [m], .stdDev = per-shot VL53L1x sigma [m]. The up reference self-calibrates (a lantern re-seats it).
+static inline void estimatorEnqueueTOFSurfaceUp(const tofMeasurement_t *tof)
+{
+  measurement_t m;
+  m.type = MeasurementTypeTOFSurfaceUp;
   m.data.tof = *tof;
   estimatorEnqueue(&m);
 }

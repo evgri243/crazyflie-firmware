@@ -32,6 +32,7 @@
 #include "pca95x4.h"
 #include "vl53l1x.h"
 #include "range.h"
+#include "estimator.h"
 #include "static_mem.h"
 
 #include "i2cdev.h"
@@ -45,6 +46,13 @@ static bool isInit = false;
 static bool isTested = false;
 static bool isPassed = false;
 static uint16_t filterMask = 1 << VL53L1_RANGESTATUS_RANGE_VALID;
+
+// Fuse the UP beam into the estimator as the opposing-surface height anchor (mm_tof_surface).
+// Default 0 = stock (UP beam log-only). Only valid returns within MR_CEILING_OUTLIER_MM are enqueued,
+// so a missing deck / bad return simply feeds nothing (graceful fallback to down-beam-only).
+static uint8_t mrUpFuse = 0;
+static float mrUpStd = 0.05f;       // [m] fallback up-beam height std (used when no per-shot sigma)
+#define MR_CEILING_OUTLIER_MM 5000  // reject >5 m / the 32767 censored sentinel
 
 #define MR_PIN_UP PCA95X4_P0
 #define MR_PIN_FRONT PCA95X4_P4
@@ -162,7 +170,19 @@ static void mrTask(void *param)
         vTaskDelayUntil(&lastWakeTime, M2T(100));
         rangeSet(rangeFront, mrGetMeasurementAndRestart(&devFront, &qFront) / 1000.0f);
         rangeSet(rangeBack, mrGetMeasurementAndRestart(&devBack, &qBack) / 1000.0f);
-        rangeSet(rangeUp, mrGetMeasurementAndRestart(&devUp, &qUp) / 1000.0f);
+        uint16_t upMm = mrGetMeasurementAndRestart(&devUp, &qUp);
+        rangeSet(rangeUp, upMm / 1000.0f);
+        // Opposing-surface UP-beam anchor: feed a VALID up return to the estimator (mm_tof_surface).
+        // Pass the per-shot VL53L1x sigma [m] as stdDev so the handler weights the up beam by its
+        // OWN reported quality (heteroscedastic R) -- a far / weak return self-reports high sigma
+        // and is trusted less. mrUpStd is the fallback when the sensor reports no sigma.
+        if (mrUpFuse != 0 && upMm < MR_CEILING_OUTLIER_MM) {
+          tofMeasurement_t up;
+          up.timestamp = xTaskGetTickCount();
+          up.distance = upMm / 1000.0f;
+          up.stdDev = (qUp.sigma > 0.0f) ? (qUp.sigma * 0.001f) : mrUpStd; // qUp.sigma is [mm]
+          estimatorEnqueueTOFSurfaceUp(&up);
+        }
         rangeSet(rangeLeft, mrGetMeasurementAndRestart(&devLeft, &qLeft) / 1000.0f);
         rangeSet(rangeRight, mrGetMeasurementAndRestart(&devRight, &qRight) / 1000.0f);
     }
@@ -247,6 +267,22 @@ PARAM_GROUP_START(multiranger)
 PARAM_ADD(PARAM_UINT16, filterMask, &filterMask)
 
 PARAM_GROUP_STOP(multiranger)
+
+/**
+ * Opposing-surface height: feed the UP beam to the estimator (mm_tof_surface).
+ */
+PARAM_GROUP_START(mrUp)
+/**
+ * @brief 1 = fuse the UP beam as the opposing-surface height anchor (mm_tof_surface), 0 = stock
+ * (log-only). Pair with the down beam (zrange.surface=1) for furniture-robust height -- the up
+ * surface holds height while a table occludes the down beam, and vice-versa for a lantern.
+ */
+PARAM_ADD(PARAM_UINT8, fuse, &mrUpFuse)
+/**
+ * @brief Fallback up-beam height measurement std [m] when the sensor reports no per-shot sigma.
+ */
+PARAM_ADD(PARAM_FLOAT, std, &mrUpStd)
+PARAM_GROUP_STOP(mrUp)
 
 /**
  * Per-beam VL53L1x return quality (front/back/left/right), sourced from the same

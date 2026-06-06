@@ -93,6 +93,10 @@ typedef struct {
 
   float baroReferenceHeight;
 
+  // NOTE: the opposing-surface FLOOR/CEILING references are NOT here -- they live module-static in
+  // mm_tof_surface.c (a surface reference is local to its fusion and re-grounds itself on the
+  // ground, so it needs no estimator-struct slot and does not bloat the covariance machinery).
+
   // Quaternion used for initial orientation [w,x,y,z]
   float initialQuaternion[4];
 
