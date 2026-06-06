@@ -59,6 +59,19 @@ static bool isInit;
 
 NO_DMA_CCM_SAFE_ZERO_INIT static VL53L1_Dev_t dev;
 
+// FLOOR (down VL53L1x) return quality -- captured from the ranging struct already read
+// each cycle and otherwise discarded. The floor signal/sigma is a direct read on the
+// surface under the drone: a dark or featureless floor (which STARVES the PMW3901 flow
+// deck) shows a weak/odd return here too, so this is an independent flow-health signal,
+// and it doubles as the floor-vs-wall classifier for the horizontal beams. Ranging untouched.
+static struct {
+  float sigma;    // SigmaMilliMeter (mm)
+  float signal;   // SignalRateRtnMegaCps (MCPS) -- floor reflectance/texture return
+  float ambient;  // AmbientRateRtnMegaCps (MCPS)
+  int16_t range;  // RangeMilliMeter (mm)
+  uint8_t status; // RangeStatus
+} zq;
+
 static uint16_t zRanger2GetMeasurementAndRestart(VL53L1_Dev_t *dev)
 {
     VL53L1_Error status = VL53L1_ERROR_NONE;
@@ -74,6 +87,13 @@ static uint16_t zRanger2GetMeasurementAndRestart(VL53L1_Dev_t *dev)
 
     status = VL53L1_GetRangingMeasurementData(dev, &rangingData);
     range = rangingData.RangeMilliMeter;
+
+    // Publish the floor return quality we would otherwise throw away (FixPoint16.16 -> float).
+    zq.sigma = rangingData.SigmaMilliMeter / 65536.0f;
+    zq.signal = rangingData.SignalRateRtnMegaCps / 65536.0f;
+    zq.ambient = rangingData.AmbientRateRtnMegaCps / 65536.0f;
+    zq.range = rangingData.RangeMilliMeter;
+    zq.status = rangingData.RangeStatus;
 
     VL53L1_StopMeasurement(dev);
     status = VL53L1_StartMeasurement(dev);
@@ -166,3 +186,17 @@ PARAM_GROUP_START(deck)
 PARAM_ADD_CORE(PARAM_UINT8 | PARAM_RONLY, bcZRanger2, &isInit)
 
 PARAM_GROUP_STOP(deck)
+
+/**
+ * Floor (down VL53L1x) return quality, sourced from the same ranging struct as
+ * range.zrange. signal/sigma read the surface texture/reflectance under the drone -- an
+ * independent flow-health signal (a flow-starving floor returns weak/odd here) and the
+ * floor side of the floor-vs-wall classifier. Updated at the ~40 Hz zranger rate.
+ */
+LOG_GROUP_START(zrq)
+LOG_ADD(LOG_FLOAT, sigma, &zq.sigma)
+LOG_ADD(LOG_FLOAT, signal, &zq.signal)
+LOG_ADD(LOG_FLOAT, ambient, &zq.ambient)
+LOG_ADD(LOG_INT16, raw, &zq.range)
+LOG_ADD(LOG_UINT8, status, &zq.status)
+LOG_GROUP_STOP(zrq)
