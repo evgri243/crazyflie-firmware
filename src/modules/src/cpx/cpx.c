@@ -44,10 +44,25 @@
 #include "aideck.h"
 #endif
 #include "cpx.h"
+#include "param.h"
 
 static CPXPacket_t cpxRx;
 
 static volatile cpxAppMessageHandlerCallback_t appMessageHandlerCallback;
+
+// AI-deck WiFi state, captured from the ESP32's WIFI_CTRL notifications below and exposed to the host
+// over the radio via the `aideck` param group at the bottom of this file — so `cffusion status` can
+// report whether the deck has joined a network (and its IP) without the host being on WiFi itself.
+static uint8_t wifiConnected = 0;
+static uint32_t wifiIp = 0;
+
+// Diagnostics for `cffusion aideck` querying. espMsgCount==0 => the ESP32 is sending NO CPX at all
+// (its firmware isn't running, or the UART link is down). wifiRespCount>0 with wifiConnected==0 =>
+// the ESP answered WiFi commands but never got an IP (wrong band/SSID/key). wifiLastResp is the last
+// WIFI_CTRL reply byte from the ESP (0x31=got-IP, 0x32=client conn/disc).
+static uint16_t espMsgCount = 0;
+static uint16_t wifiRespCount = 0;
+static uint8_t wifiLastResp = 0;
 
 #define WIFI_SET_SSID_CMD         0x10
 #define WIFI_SET_KEY_CMD          0x11
@@ -99,14 +114,23 @@ static void cpx(void* _param) {
 
     //DEBUG_PRINT("CPX RX: Message from [0x%02X] to function [0x%02X] (size=%u)\n", cpxRx.route.source, cpxRx.route.function, cpxRx.dataLength);
 
+    if (cpxRx.route.source == CPX_T_ESP32) {
+      espMsgCount++;  // any CPX traffic from the ESP -> it's alive and the UART link works
+    }
+
     switch (cpxRx.route.function) {
       case CPX_F_WIFI_CTRL:
+        wifiRespCount++;
+        wifiLastResp = cpxRx.data[0];
         if (cpxRx.data[0] == WIFI_AP_CONNECTED_CMD) {
             DEBUG_PRINT("WiFi connected to ip: %u.%u.%u.%u\n",
                         cpxRx.data[1],
                         cpxRx.data[2],
                         cpxRx.data[3],
                         cpxRx.data[4]);
+            wifiIp = ((uint32_t)cpxRx.data[1] << 24) | ((uint32_t)cpxRx.data[2] << 16) |
+                     ((uint32_t)cpxRx.data[3] << 8) | (uint32_t)cpxRx.data[4];
+            wifiConnected = 1;
         }
         if (cpxRx.data[0] == WIFI_CLIENT_CONNECTED_CMD) {
           if (cpxRx.data[1] == 0x00) {
@@ -119,6 +143,10 @@ static void cpx(void* _param) {
         }
         break;
       case CPX_F_CONSOLE:
+        // The %s prints below require a NUL terminator. A console message that fills the buffer
+        // without one would run %s off the end and hardfault — so force-terminate within bounds.
+        // (This newly matters now that runtime WiFi config makes the ESP emit connection logs.)
+        cpxRx.data[(cpxRx.dataLength < sizeof(cpxRx.data)) ? cpxRx.dataLength : (sizeof(cpxRx.data) - 1)] = '\0';
         if (cpxRx.route.source == CPX_T_ESP32) {
           DEBUG_PRINT("ESP32: %s", cpxRx.data);
         } else if (cpxRx.route.source == CPX_T_GAP8) {
@@ -163,5 +191,42 @@ static void cpx(void* _param) {
 }
 
 void cpxInit() {
-  xTaskCreate(cpx, CPX_TASK_NAME, AI_DECK_TASK_STACKSIZE, NULL, AI_DECK_TASK_PRI, NULL);
+  // 2x stack: this dispatcher formats console strings with DEBUG_PRINT (%s/%u), which the bare
+  // AI_DECK_TASK_STACKSIZE (150 words) can overflow under the ESP's WiFi-connect console burst.
+  xTaskCreate(cpx, CPX_TASK_NAME, 2 * AI_DECK_TASK_STACKSIZE, NULL, AI_DECK_TASK_PRI, NULL);
 }
+
+/**
+ * AI-deck WiFi status, readable from the host over the radio (used by `cffusion status`).
+ */
+PARAM_GROUP_START(aideck)
+
+/**
+ * @brief Nonzero once the AI-deck has joined a WiFi network (received an IP from the ESP32).
+ */
+PARAM_ADD_CORE(PARAM_UINT8 | PARAM_RONLY, wifiConn, &wifiConnected)
+
+/**
+ * @brief AI-deck IPv4 address as a big-endian uint32 (octet1<<24 | octet2<<16 | octet3<<8 | octet4);
+ * 0 when not connected.
+ */
+PARAM_ADD_CORE(PARAM_UINT32 | PARAM_RONLY, wifiIp, &wifiIp)
+
+/**
+ * @brief Count of CPX messages received from the ESP32. 0 = the ESP is silent (its firmware isn't
+ * running, or the deck UART link is down) — a WiFi config can't work until this is nonzero.
+ */
+PARAM_ADD_CORE(PARAM_UINT16 | PARAM_RONLY, espMsgN, &espMsgCount)
+
+/**
+ * @brief Count of WIFI_CTRL replies from the ESP32. >0 with wifiConn==0 means it tried to associate
+ * but never got an IP (typically a 5 GHz SSID, wrong key, or out of range).
+ */
+PARAM_ADD_CORE(PARAM_UINT16 | PARAM_RONLY, wifiRespN, &wifiRespCount)
+
+/**
+ * @brief Last WIFI_CTRL reply byte from the ESP32 (0x31 = got IP, 0x32 = client connect/disconnect).
+ */
+PARAM_ADD_CORE(PARAM_UINT8 | PARAM_RONLY, wifiResp, &wifiLastResp)
+
+PARAM_GROUP_STOP(aideck)

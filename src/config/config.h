@@ -50,7 +50,10 @@
 #define MCU_ID_ADDRESS          0x1FFF7A10
 #define MCU_FLASH_SIZE_ADDRESS  0x1FFF7A22
 #ifndef FREERTOS_HEAP_SIZE
-  #define FREERTOS_HEAP_SIZE      30000
+  // Bumped 30000 -> 40000: the stock value left only ~7 KB free at boot on this 3-deck build, and
+  // bringing the AI-deck WiFi up at runtime can malloc past that (-> vApplicationMallocFailedHook
+  // -> hang -> watchdog reboot). RAM has the headroom (was ~40 KB free).
+  #define FREERTOS_HEAP_SIZE      40000
 #endif
 #define FREERTOS_MIN_STACK_SIZE 150       // M4-FPU register setup is bigger so stack needs to be bigger
 #define FREERTOS_MCU_CLOCK_HZ   168000000

@@ -306,6 +306,8 @@ typedef struct tofMeasurement_s {
   uint32_t timestamp;
   float distance;
   float stdDev;
+  float signal;    // VL53L1x SignalRateRtnMegaCps [MCPS]; 0 => not provided (quality gate inert)
+  uint8_t status;  // VL53L1x RangeStatus (0=VALID, 1=SIGMA_FAIL, 2=SIGNAL_FAIL, 4=OOB, 7=WRAP...)
 } tofMeasurement_t;
 
 /** Absolute height measurement */

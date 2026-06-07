@@ -60,6 +60,9 @@
 #include "cpx_external_router.h"
 #include "cpx_uart_transport.h"
 #include "cpx.h"
+#include "app_channel.h"
+#include "static_mem.h"
+#include "storage.h"
 
 #include "aideck.h"
 
@@ -308,6 +311,171 @@ uint8_t espDeckFlasherPropertiesQuery()
   }
   #endif
 
+// --- Runtime WiFi (re)configuration from the host over the CRTP app-channel --------------------
+// The compile-time setupWiFi() above bakes the SSID/key into the binary. This task lets the host
+// (`cffusion aideck configure`) set them at runtime instead: it forwards the SET_SSID / SET_KEY /
+// CONNECT payloads to the ESP32 as CPX WIFI_CTRL packets. Two extra host-only commands (not
+// forwarded) make the config survive reboots: PERSIST saves the last-set creds to the Crazyflie's
+// key/value storage (EEPROM); at boot we re-apply them so the deck rejoins without the host. Each
+// command is acked back as [WIFI_CFG_ACK_MAGIC, cmd].
+#define WIFI_CFG_ACK_MAGIC    0xA0
+#define WIFI_CFG_PERSIST_CMD  0x40  // host -> STM32 only: save the last-set creds to storage
+#define WIFI_CFG_FORGET_CMD   0x41  // host -> STM32 only: clear the saved creds
+
+#define AIDECK_WIFI_STORE_KEY "aidwifi"
+#define AIDECK_WIFI_SSID_MAX  32
+#define AIDECK_WIFI_KEY_MAX   64
+
+typedef struct {
+  uint8_t mode;     // WIFI_CONNECT_AS_STA / _AP
+  uint8_t ssidLen;
+  uint8_t keyLen;
+  char ssid[AIDECK_WIFI_SSID_MAX];
+  char key[AIDECK_WIFI_KEY_MAX];
+} __attribute__((packed)) AiDeckWifiStore_t;
+
+static CPXPacket_t wifiCfgCpxTx;
+static char wifiLastSsid[AIDECK_WIFI_SSID_MAX];
+static char wifiLastKey[AIDECK_WIFI_KEY_MAX];
+static uint8_t wifiLastSsidLen = 0;
+static uint8_t wifiLastKeyLen = 0;
+static uint8_t wifiLastMode = WIFI_CONNECT_AS_STA;
+static bool wifiConnectIssued = false;  // a CONNECT has been sent this boot (boot-apply or host)
+
+// Forward a WIFI_CTRL payload to the ESP32 over CPX.
+static void wifiForwardToEsp(const uint8_t *data, size_t len) {
+  cpxInitRoute(CPX_T_STM32, CPX_T_ESP32, CPX_F_WIFI_CTRL, &wifiCfgCpxTx.route);
+  memcpy(wifiCfgCpxTx.data, data, len);
+  wifiCfgCpxTx.dataLength = len;
+  cpxSendPacketBlocking(&wifiCfgCpxTx);
+}
+
+// Send a full SET_SSID / SET_KEY / CONNECT sequence to the ESP from explicit creds (NUL-terminated,
+// matching what the host sends). Used to re-apply persisted creds at boot.
+static void wifiSendCreds(uint8_t mode, const char *ssid, uint8_t ssidLen, const char *key, uint8_t keyLen) {
+  static uint8_t p[1 + AIDECK_WIFI_KEY_MAX + 1];
+
+  p[0] = WIFI_SET_SSID_CMD;
+  memcpy(&p[1], ssid, ssidLen);
+  p[1 + ssidLen] = '\0';
+  wifiForwardToEsp(p, 1 + ssidLen + 1);
+
+  p[0] = WIFI_SET_KEY_CMD;
+  memcpy(&p[1], key, keyLen);
+  p[1 + keyLen] = '\0';
+  wifiForwardToEsp(p, 1 + keyLen + 1);
+
+  p[0] = WIFI_CONNECT_CMD;
+  p[1] = mode;
+  wifiForwardToEsp(p, WIFI_CONNECT_AS_LENGTH);
+}
+
+// If creds were persisted, re-apply them to the ESP (called once at startup).
+// Reboot the deck (GAP8 + ESP share the IO4 reset line) into a fresh state, keeping the CPX UART up.
+// The aideck-esp-firmware can't re-init WiFi without a fresh boot (its CONNECT does
+// esp_netif_create_default_wifi_sta() + esp_wifi_start() with no teardown, under ESP_ERROR_CHECK),
+// so a runtime *reconfigure* needs this. NB: it also reboots the GAP8 — any camera stream blips.
+static void aiDeckResetDeck(void) {
+  pinMode(DECK_GPIO_IO4, OUTPUT);
+  digitalWrite(DECK_GPIO_IO4, LOW);
+  vTaskDelay(M2T(50));
+  digitalWrite(DECK_GPIO_IO4, HIGH);
+  pinMode(DECK_GPIO_IO4, INPUT_PULLUP);
+}
+
+static void wifiApplyStored(void) {
+  static AiDeckWifiStore_t cfg;
+
+  size_t n = storageFetch(AIDECK_WIFI_STORE_KEY, &cfg, sizeof(cfg));
+  if (n == sizeof(cfg) && cfg.ssidLen > 0 &&
+      cfg.ssidLen <= AIDECK_WIFI_SSID_MAX && cfg.keyLen <= AIDECK_WIFI_KEY_MAX) {
+    DEBUG_PRINT("AIDECK: re-applying persisted WiFi config\n");
+    wifiSendCreds(cfg.mode, cfg.ssid, cfg.ssidLen, cfg.key, cfg.keyLen);
+    wifiConnectIssued = true;  // ESP is now busy with this connection → a runtime reconfig must reset
+  }
+}
+
+static void aiDeckWifiCfgTask(void *param)
+{
+  static uint8_t buf[APPCHANNEL_MTU];
+
+  systemWaitStart();
+  vTaskDelay(M2T(3000));  // let the ESP finish booting before (re)applying any persisted creds
+  wifiApplyStored();
+
+  while (1) {
+    size_t len = appchannelReceiveDataPacket(buf, sizeof(buf), portMAX_DELAY);
+    if (len < 1) {
+      continue;
+    }
+
+    const uint8_t cmd = buf[0];
+    switch (cmd) {
+      case WIFI_SET_SSID_CMD:
+      case WIFI_SET_KEY_CMD: {
+        wifiForwardToEsp(buf, len);
+        // Capture the cred (drop the trailing NUL the host appends) so PERSIST or a reconfigure-reset
+        // can re-send it.
+        size_t pl = len - 1;
+        if (pl > 0 && buf[len - 1] == '\0') {
+          pl--;
+        }
+        if (cmd == WIFI_SET_SSID_CMD) {
+          if (pl > AIDECK_WIFI_SSID_MAX) pl = AIDECK_WIFI_SSID_MAX;
+          memcpy(wifiLastSsid, &buf[1], pl);
+          wifiLastSsidLen = pl;
+        } else {
+          if (pl > AIDECK_WIFI_KEY_MAX) pl = AIDECK_WIFI_KEY_MAX;
+          memcpy(wifiLastKey, &buf[1], pl);
+          wifiLastKeyLen = pl;
+        }
+        break;
+      }
+
+      case WIFI_CONNECT_CMD:
+        wifiLastMode = (len >= 2) ? buf[1] : WIFI_CONNECT_AS_STA;
+        if (wifiConnectIssued) {
+          // Reconfigure: the ESP can't re-init WiFi without a fresh boot, so reboot the deck, let it
+          // come up, then re-apply the just-captured creds to the fresh ESP.
+          DEBUG_PRINT("AIDECK: reconfigure — resetting the deck for a fresh ESP\n");
+          aiDeckResetDeck();
+          vTaskDelay(M2T(3000));
+          wifiSendCreds(wifiLastMode, wifiLastSsid, wifiLastSsidLen, wifiLastKey, wifiLastKeyLen);
+        } else {
+          wifiForwardToEsp(buf, len);  // first CONNECT this boot — the ESP is already fresh
+        }
+        wifiConnectIssued = true;
+        break;
+
+      case WIFI_CFG_PERSIST_CMD: {
+        static AiDeckWifiStore_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.mode = wifiLastMode;
+        cfg.ssidLen = wifiLastSsidLen;
+        cfg.keyLen = wifiLastKeyLen;
+        memcpy(cfg.ssid, wifiLastSsid, wifiLastSsidLen);
+        memcpy(cfg.key, wifiLastKey, wifiLastKeyLen);
+        bool ok = storageStore(AIDECK_WIFI_STORE_KEY, &cfg, sizeof(cfg));
+        DEBUG_PRINT("AIDECK: WiFi creds %s\n", ok ? "persisted" : "persist FAILED");
+        break;  // not forwarded to ESP
+      }
+
+      case WIFI_CFG_FORGET_CMD:
+        storageDelete(AIDECK_WIFI_STORE_KEY);
+        DEBUG_PRINT("AIDECK: persisted WiFi cleared\n");
+        break;  // not forwarded to ESP
+
+      default:
+        continue;  // not a WiFi-config packet — leave it for any other consumer
+    }
+
+    const uint8_t ack[2] = { WIFI_CFG_ACK_MAGIC, cmd };
+    appchannelSendDataPacketBlock((void *)ack, sizeof(ack));
+  }
+}
+
+STATIC_MEM_TASK_ALLOC(aiDeckWifiCfgTask, 2 * configMINIMAL_STACK_SIZE);
+
 
 static void aideckInit(DeckInfo *info)
 {
@@ -337,6 +505,9 @@ static void aideckInit(DeckInfo *info)
 #else
   setupWiFi();
 #endif
+
+  // Runtime WiFi (re)configuration from the host over the app-channel (`cffusion aideck configure`).
+  STATIC_MEM_TASK_CREATE(aiDeckWifiCfgTask, aiDeckWifiCfgTask, "AIDECK-WIFICFG", NULL, AI_DECK_TASK_PRI);
 
   isInit = true;
 }
