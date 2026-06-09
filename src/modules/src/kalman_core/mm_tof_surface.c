@@ -241,6 +241,27 @@ void kalmanCoreUpdateWithTofUp(kalmanCoreData_t* this, tofMeasurement_t* tof, bo
   surfaceUpdate(this, tof, quadIsFlying, &upSurf);
 }
 
+// Clear the module-static down/up references back to their static-initialiser values. The on-board
+// re-grounding flow keeps the live drone consistent across a kalman.resetEstimation pulse (every
+// pre-flight frame forces down -> 0 and re-captures the up reference), so this is a NO-OP for
+// flight. Offline replays go straight from one airborne session into the next with no on-ground
+// frames between, however, so the previous session's re-seated table / lantern reference would
+// otherwise leak into the next replay -- which is why offline SIL callers MUST invoke this between
+// replays. Mirrors kalmanCoreWallReset.
+void kalmanCoreSurfaceReset(void)
+{
+  downSurf = (surfaceRef_t){
+    .ref = 0.0f, .var = 0.01f, .lastMs = 0, .seeded = true,
+    .captureOnGround = false, .sign = 1.0f,
+    .logRef = 0.0f, .logInnov = 0.0f, .logW = 1.0f,
+  };
+  upSurf = (surfaceRef_t){
+    .ref = 0.0f, .var = 0.01f, .lastMs = 0, .seeded = false,
+    .captureOnGround = true, .sign = -1.0f,
+    .logRef = 0.0f, .logInnov = 0.0f, .logW = 1.0f,
+  };
+}
+
 /**
  * Opposing-surface (down + up beam) height-fusion tuning. Threshold-free: these shape the
  * Student-t robust weight and the self-calibrating reference, NOT a gate. Defaults are ported

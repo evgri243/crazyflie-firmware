@@ -38,3 +38,9 @@
 // (re-)grounding (down ref -> 0) / up-reference capture.
 void kalmanCoreUpdateWithTofDown(kalmanCoreData_t* this, tofMeasurement_t* tof, bool quadIsFlying);
 void kalmanCoreUpdateWithTofUp(kalmanCoreData_t* this, tofMeasurement_t* tof, bool quadIsFlying);
+
+// Clear the module-static down/up references back to their static-initialiser values. On-board
+// flights re-ground naturally via the pre-flight frames, so this is a no-op there; offline SIL
+// callers MUST invoke it between replays or the previous session's re-seated table / lantern
+// reference will leak forward. Mirrors kalmanCoreWallReset.
+void kalmanCoreSurfaceReset(void);
