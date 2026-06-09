@@ -94,6 +94,28 @@ static float wallRaycastCosMin      = 0.30f; // abs_raycast_cos_min: clamp on th
 static float wallRaycastFloorWMin   = 0.01f; // abs_raycast_floor_w_min: floor confidence lower clamp
 static const float wallDtMaxS = 0.20f;  // clamp the random-walk dt across a sensor gap [s]
 
+// --- YAW-AWARE WORLD-PLANE model (mrWalls.worldPlanes; default OFF = legacy body-locked path) ---
+//   Re-keys the 4 references from body beams to 4 WORLD-FIXED cardinal vertical planes and
+//   associates each beam to a plane by the LIVE yaw, so the absolute wall lock survives an
+//   in-place rotation (a hover 360). Firmware port of the validated Python `abs_world_planes`
+//   model (offline commit 45aba38; design docs/motion-fusion-plan.md), ABSOLUTE channel only.
+static uint8_t mrWallsWorldPlanes   = 0;     // 0 = legacy front->X/left->Y; 1 = world planes
+static float wallIncCosMin          = 0.50f; // grazing HARD-DROP: skip a beam whose |g| < this
+static float wallAssocReevalG       = 0.60f; // force re-association once the held plane's g drops below this
+static float wallAssocHyst          = 0.05f; // g-margin a competitor must beat the held plane by to switch
+static float wallInnovHardDropM     = 0.60f; // drop a strong-but-wildly-wrong return (doorway / far wall) [m]
+static float wallUnconvergedVarM2   = 0.50f; // above this plane var, offset-only update (position rides flow)
+static float wallJumpBandLoM        = 0.10f; // jump-diffusion re-seat only inside a furniture-plausible band [m]
+static float wallJumpBandHiM        = 0.50f; //   (a 2 m far-wall innovation must NOT loosen an offset)
+// mrq QUALITY data-association: drop a beam the VL53L1x itself flags untrustworthy (grazing/weak/wrapped)
+// using the per-shot signal + status now plumbed through tofMeasurement_t. This is what drops the
+// BIASED beam AT a crossover (its incidence rises -> its signal collapses) instead of letting it snap
+// position. Status is always available; the signal floor applies only when a signal is reported.
+static uint8_t wallQuality          = 1;     // 0 = pure geometry (the A/B baseline); 1 = quality gate on
+static float wallQSignalMin         = 0.5f;  // [MCPS] reject below this return strength (SIGNAL_FAIL knee)
+// (a |omega_z| alias backstop is deferred: a slow commanded 360 (~30 deg/s) never aliases a wall
+//  between the 10 Hz samples, and the gyro rate is not retained in kalmanCoreData_t.)
+
 typedef struct {
   float ref;            // wall position along its axis [m] (~ preflight wall range at takeoff)
   float var;            // reference variance [m^2]
@@ -140,6 +162,65 @@ static wallRef_t rightWall = {
   .posAxis = KC_STATE_Y, .rRow = 1, .sign = 1.0f, .dzSign = -1.0f,
   .logRef = 0.0f, .logInnov = 0.0f, .logW = 1.0f,
 };
+
+// ============================================================================
+//  WORLD-PLANE state (mrWalls.worldPlanes path). Four world-fixed cardinal vertical planes; a
+//  reference is the signed plane offset d_k along its fixed normal n_k. Each of the four beams
+//  associates to ONE plane by the live yaw, so as the craft rotates the FRONT beam re-points from
+//  the +X plane onto the +Y plane (a pure pointer change) and the plane offset it reads was already
+//  seeded by the LEFT beam at takeoff -- the absolute lock survives the rotation. At yaw0/level each
+//  beam maps 1:1 to its natural plane (front->+X, back->-X, left->+Y, right->-Y), which is what makes
+//  the world path byte-reduce to the legacy body-locked path (the reduction-test gate).
+typedef enum { BEAM_FRONT = 0, BEAM_BACK, BEAM_LEFT, BEAM_RIGHT } wallBeam_t;
+// body-frame beam direction (x fwd, y left); z is 0 for all four horizontal beams.
+static const float beamDirX[4] = { 1.0f, -1.0f, 0.0f,  0.0f };
+static const float beamDirY[4] = { 0.0f,  0.0f, 1.0f, -1.0f };
+
+typedef enum { PLANE_PX = 0, PLANE_NX, PLANE_PY, PLANE_NY } wallPlane_t;
+typedef struct {
+  float ref;       // plane offset d_k along n_k [m]
+  float var;       // reference variance [m^2]
+  uint32_t lastMs; // tick of the last update (random-walk dt)
+  bool seeded;     // reference initialised
+  float nx, ny;    // fixed world-plane normal (cardinal)
+  float logRef;    // diagnostics
+} planeRef_t;
+static planeRef_t planes[4] = {
+  { .ref = 0.0f, .var = 0.01f, .lastMs = 0, .seeded = false, .nx =  1.0f, .ny =  0.0f, .logRef = 0.0f },
+  { .ref = 0.0f, .var = 0.01f, .lastMs = 0, .seeded = false, .nx = -1.0f, .ny =  0.0f, .logRef = 0.0f },
+  { .ref = 0.0f, .var = 0.01f, .lastMs = 0, .seeded = false, .nx =  0.0f, .ny =  1.0f, .logRef = 0.0f },
+  { .ref = 0.0f, .var = 0.01f, .lastMs = 0, .seeded = false, .nx =  0.0f, .ny = -1.0f, .logRef = 0.0f },
+};
+// per-beam hysteresis: the plane each beam was associated to last tick (-1 = none yet).
+static int wallPrevPlane[4] = { -1, -1, -1, -1 };
+// diagnostics: the plane each beam is currently associated to, and handoff/drop counters.
+static int32_t wallAssocPlane[4] = { -1, -1, -1, -1 };
+static uint32_t wallHandoffCount = 0;
+static uint32_t wallDropCount = 0;
+
+// Pick the world plane a beam (world-horizontal dir (ux,uy)) points at = argmax g_k, g_k = n_k.u_xy
+// (most perpendicular incidence). Hysteresis holds the previous plane unless its g falls below the
+// re-eval floor or a competitor beats it by the margin (kills 45deg chatter). HARD-DROP (return -1)
+// when the chosen |g| is below the grazing floor: never fuse a clamped grazing beam (a perpendicular
+// partner is rank-2 at 45deg, so dropping a grazing beam loses no observability). *gOut/*handoff set
+// only when a plane is returned.
+static int wallAssociatePlane(float ux, float uy, int prev, float* gOut, bool* handoff)
+{
+  float gs[4];
+  for (int k = 0; k < 4; k++) { gs[k] = planes[k].nx * ux + planes[k].ny * uy; }
+  int best = 0;
+  for (int k = 1; k < 4; k++) { if (gs[k] > gs[best]) { best = k; } }
+  int k = best;
+  if (prev >= 0 && prev != best
+      && gs[prev] >= wallAssocReevalG
+      && (gs[best] - gs[prev]) <= wallAssocHyst) {
+    k = prev;  // hold the previous plane (hysteresis)
+  }
+  if (gs[k] < wallIncCosMin) { return -1; }  // grazing/ambiguous -> hard drop
+  *gOut = gs[k];
+  *handoff = (prev >= 0 && k != prev);
+  return k;
+}
 
 // Takeoff heading, captured from the quaternion while on the ground. The yaw-hold down-weight
 // inflates R as the craft rotates away from this heading (the beam->axis mapping assumes it).
@@ -319,6 +400,207 @@ static void wallUpdate(kalmanCoreData_t* this, tofMeasurement_t* tof,
   wall->var *= (1.0f - Kref);
 }
 
+// ============================================================================
+//  WORLD-PLANE update (mrWalls.worldPlanes = 1). The yaw-aware twin of wallUpdate: instead of a
+//  beam being bolted to one world axis, it is rotated by the LIVE attitude and projected onto the
+//  nearest world-fixed cardinal plane. The single denominator g = n_k.u_world_xy folds azimuth
+//  incidence AND pitch/roll tilt into one cosine; a yaw handoff is a pure beam->plane re-pointer.
+//  Byte-reduces to wallUpdate at yaw0/level (the reduction-test gate). The robust Student-t weight,
+//  heteroscedastic R, ray-cast floor down-weight and jump-diffusion re-seat are identical to the
+//  legacy kernel; the differences are the geometry, the 2-axis Jacobian H=[nkx,nky], and the
+//  motion-capable defenses (fix #3 grazing hard-drop, #5 far-wall innovation drop, #8 offset-only
+//  handoff, #11 (1/g_azim)^2 R-inflation replacing the legacy yaw_dev fade).
+static void wallUpdateWorld(kalmanCoreData_t* this, tofMeasurement_t* tof,
+                            bool quadIsFlying, wallBeam_t beam)
+{
+  if (!(tof->distance > 0.05f && tof->distance < 5.0f)) {
+    return;
+  }
+
+  // --- mrq QUALITY GATE: reject a beam the sensor self-reports as untrustworthy. A beam sweeping
+  //     toward grazing at a crossover loses signal first, so dropping it here is the data-association
+  //     that prevents the biased return from snapping position. Status is always present; the signal
+  //     floor applies only when a signal is reported (>0), so a preset that omits signal degrades to
+  //     status-only gating rather than dropping every beam. Inert at a clean hover (high signal,
+  //     status 0) -> the world path still reduces to legacy. ---
+  if (wallQuality) {
+    bool statusBad = (tof->status > 1);  // not VALID(0) / SIGMA_FAIL(1, raw-recoverable)
+    bool signalBad = (tof->signal > 0.0f && tof->signal < wallQSignalMin);
+    if (statusBad || signalBad) {
+      wallDropCount++;
+      wallAssocPlane[beam] = -1;
+      return;
+    }
+  }
+
+  // --- world-horizontal beam direction in the ROOM frame (de-rotated by the takeoff heading yaw0).
+  //     uw = R . u_body (R is body->world, the EKF DCM); rotating uw_xy by -yaw0 removes the takeoff
+  //     heading so the four cardinal planes track the ROOM, not the EKF world frame. This equals
+  //     _body_to_world_R(roll,pitch,yaw_rel) . u_body exactly (Rz(-yaw0).Rz(yaw) = Rz(yaw_rel)). ---
+  float ubx = beamDirX[beam], uby = beamDirY[beam];   // body dir (ubz = 0)
+  float uwx = this->R[0][0] * ubx + this->R[0][1] * uby;
+  float uwy = this->R[1][0] * ubx + this->R[1][1] * uby;
+  float dz  = this->R[2][0] * ubx + this->R[2][1] * uby;  // world-Z of the beam (yaw-invariant)
+  float c0 = cosf(wallYaw0), s0 = sinf(wallYaw0);
+  float ux =  c0 * uwx + s0 * uwy;   // de-rotate xy into the room frame
+  float uy = -s0 * uwx + c0 * uwy;
+
+  // --- associate this beam to a world plane (argmax g + hysteresis + grazing hard-drop, fix #3) ---
+  float g = 0.0f;
+  bool handoff = false;
+  int k = wallAssociatePlane(ux, uy, wallPrevPlane[beam], &g, &handoff);
+  if (k < 0) {
+    wallDropCount++;
+    wallAssocPlane[beam] = -1;
+    return;  // grazing/ambiguous: no update this tick
+  }
+  planeRef_t* pl = &planes[k];
+  float nkx = pl->nx, nky = pl->ny;
+  float r_h = g * tof->distance;     // horizontal range projected on the plane normal
+
+  // --- reference random-walk predict (dt since THIS plane last updated) ---
+  if (pl->lastMs != 0) {
+    float dt = (float)(tof->timestamp - pl->lastMs) * 0.001f;
+    if (dt > 0.0f) {
+      if (dt > wallDtMaxS) { dt = wallDtMaxS; }
+      pl->var += wallRwStd * wallRwStd * dt;
+    }
+  }
+  pl->lastMs = tof->timestamp;
+
+  float stateProj = nkx * this->S[KC_STATE_X] + nky * this->S[KC_STATE_Y];
+
+  // --- on the ground: re-capture the plane offset (d_k = n_k.P + r_h) every frame, and capture the
+  //     takeoff heading yaw0. At yaw_rel ~ 0 each beam maps 1:1 to its natural plane, so the four
+  //     planes seed exactly as the legacy walls do (front->+X, back->-X, left->+Y, right->-Y). ---
+  if (!quadIsFlying) {
+    pl->ref = stateProj + r_h;
+    pl->var = wallInitVarM2;
+    pl->seeded = true;
+    pl->logRef = pl->ref;
+    wallYaw0 = atan2f(2.0f * (this->q[1] * this->q[2] + this->q[0] * this->q[3]),
+                      this->q[0] * this->q[0] + this->q[1] * this->q[1]
+                        - this->q[2] * this->q[2] - this->q[3] * this->q[3]);
+    wallYaw0Seeded = true;
+    wallPrevPlane[beam] = k;
+    wallAssocPlane[beam] = k;
+    return;
+  }
+  if (!pl->seeded) {
+    pl->ref = stateProj + r_h;
+    pl->var = wallInitVarM2;
+    pl->seeded = true;
+  }
+  if (handoff) { wallHandoffCount++; }
+  wallPrevPlane[beam] = k;
+  wallAssocPlane[beam] = k;
+
+  // --- heteroscedastic measurement variance from the sensor's per-shot sigma (matches legacy) ---
+  float rangeVar;
+  if (tof->stdDev > 0.0f) {
+    float sig = tof->stdDev;
+    if (sig < wallSigFloorM) { sig = wallSigFloorM; }
+    rangeVar = sig * sig + wallSigModelM * wallSigModelM;
+  } else {
+    rangeVar = wallStdFallbackM * wallStdFallbackM;
+  }
+  float measPosVar = rangeVar * g * g;   // project the range variance onto the plane normal
+
+  // --- R-inflation (fix #11): the world model handles yaw via g + association, so it uses the
+  //     roll/pitch wobble ONLY (NOT yaw_dev, which g already accounts for) plus a (1/g_azim)^2
+  //     oblique-incidence term that is EXACTLY 1 at yaw_rel=0 (reduction-preserving). ---
+  float roll = atan2f(2.0f * (this->q[2] * this->q[3] + this->q[0] * this->q[1]),
+                      this->q[0] * this->q[0] - this->q[1] * this->q[1]
+                        - this->q[2] * this->q[2] + this->q[3] * this->q[3]);
+  float pitch = asinf(-2.0f * (this->q[1] * this->q[3] - this->q[0] * this->q[2]));
+  float rollDeg = fabsf(roll) * RAD_TO_DEG;
+  float pitchDeg = fabsf(pitch) * RAD_TO_DEG;
+  float worstDeg = (rollDeg > pitchDeg) ? rollDeg : pitchDeg;
+  float scale = (wallTiltRScaleDeg > 1e-6f) ? wallTiltRScaleDeg : 1e-6f;
+  float tiltMult = 1.0f + (worstDeg / scale) * (worstDeg / scale);
+  float uxyNorm = sqrtf(ux * ux + uy * uy);
+  if (uxyNorm < 1e-9f) { uxyNorm = 1e-9f; }
+  float gAzim = g / uxyNorm;          // cos(azimuth incidence) = 1 at yaw_rel=0
+  if (gAzim < 1e-6f) { gAzim = 1e-6f; }
+  tiltMult /= (gAzim * gAzim);
+
+  // --- RAY-CAST wall-vs-floor down-weight (shared with legacy; dz<0 => beam descends to the floor) ---
+  float floorRMult = 1.0f;
+  if (dz < -1e-3f) {
+    float z = this->S[KC_STATE_Z];
+    float sFloor = -z / dz;                        // slant range at which the beam reaches Z=0
+    float predWall = (pl->ref - stateProj) / g;    // state-predicted wall slant (== Python pred_wall)
+    float margin = (sFloor - predWall) / wallRaycastFloorScaleM;
+    if (margin > 30.0f)  { margin = 30.0f; }
+    if (margin < -30.0f) { margin = -30.0f; }
+    float wWall = 1.0f / (1.0f + expf(-margin));
+    float wFloor = (wWall > wallRaycastFloorWMin) ? wWall : wallRaycastFloorWMin;
+    floorRMult = 1.0f / wFloor;
+  }
+
+  // --- position pseudo-measurement of n_k.P: measProj = d_k - r_h, H = [nkx, nky] ---
+  float measProj = pl->ref - r_h;
+  float innov = measProj - stateProj;
+
+  // fix #5: a strong-but-wildly-wrong return (doorway / far wall past the plane) is a re-association
+  // event, not a noisy hit -- DROP it rather than letting it yank position or loosen the offset.
+  if (fabsf(innov) > wallInnovHardDropM) {
+    wallDropCount++;
+    pl->logRef = pl->ref;
+    return;
+  }
+
+  float measPosVarEff = measPosVar * tiltMult * floorRMult;
+  // H P H^T for H = [nkx, nky] on (X, Y): nkx^2 Pxx + 2 nkx nky Pxy + nky^2 Pyy.
+  float Pxx = this->P[KC_STATE_X][KC_STATE_X];
+  float Pyy = this->P[KC_STATE_Y][KC_STATE_Y];
+  float Pxy = this->P[KC_STATE_X][KC_STATE_Y];
+  float HPHt = nkx * nkx * Pxx + 2.0f * nkx * nky * Pxy + nky * nky * Pyy;
+  float Sinnov = measPosVarEff + pl->var + HPHt;
+  float w = 1.0f;
+  if (Sinnov > 0.0f) {
+    float rstd2 = (innov * innov) / Sinnov;
+    w = (wallNu + 1.0f) / (wallNu + rstd2);
+  }
+  float wClip = w;
+  if (wClip > 1.0f) { wClip = 1.0f; }
+  if (wClip < wallWMin) { wClip = wallWMin; }
+
+  // fix #8: on a handoff to (or an already) UNCONVERGED plane offset, do an OFFSET-ONLY update --
+  // skip the position correction (it would snap to a stale/loose reference) and let position ride
+  // flow/INS while the reference re-seats onto the wall. Jump-diffusion is also frozen on a handoff.
+  bool offsetOnly = handoff || (pl->var > wallUnconvergedVarM2);
+
+  // --- LAYER 1: main EKF position update, R inflated by 1/w (reference uncertainty included) ---
+  if (!offsetOnly) {
+    float Reff = (measPosVarEff + pl->var) / wClip;
+    float h[KC_STATE_DIM] = {0};
+    arm_matrix_instance_f32 H = {1, KC_STATE_DIM, h};
+    h[KC_STATE_X] = nkx;
+    h[KC_STATE_Y] = nky;
+    kalmanCoreScalarUpdate(this, &H, innov, sqrtf(Reff));
+  }
+
+  // --- LAYER 2: jump-diffusion re-seat of THIS plane's offset (frozen on a handoff; gated to a
+  //     furniture-plausible innovation band so a far-wall step cannot loosen the offset, fix #5) ---
+  float absInnov = fabsf(innov);
+  if (!handoff && w < wallReseatWMax
+      && absInnov >= wallJumpBandLoM && absInnov <= wallJumpBandHiM) {
+    float inject = (1.0f - wClip) * wallJumpCouple * wallJumpSizeM * wallJumpSizeM;
+    float room = wallAVarMaxM2 - pl->var;
+    if (room < 0.0f) { room = 0.0f; }
+    if (inject > room) { inject = room; }
+    pl->var += inject;
+  }
+  // refObs observes the SAME quantity as the capture/seed (d_k = n_k.P + r_h) using the POST-update P.
+  float stateProjPost = nkx * this->S[KC_STATE_X] + nky * this->S[KC_STATE_Y];
+  float refObs = stateProjPost + r_h;
+  float Kref = pl->var / (pl->var + measPosVarEff);
+  pl->ref += Kref * (refObs - pl->ref);
+  pl->var *= (1.0f - Kref);
+  pl->logRef = pl->ref;
+}
+
 // Clear all module-static wall state so the next flight re-seeds its references FRESH (at the first
 // in-flight frame, with X,Y ~ 0 at takeoff) instead of inheriting a prior flight's re-seated box/hand
 // reference. MUST be called on every estimator reset: unlike the down/up surfaces (whose down beam
@@ -339,26 +621,42 @@ void kalmanCoreWallReset(void)
   }
   wallYaw0 = 0.0f;
   wallYaw0Seeded = false;
+  // world-plane references + per-beam hysteresis/diagnostics (mrWalls.worldPlanes path)
+  for (int k = 0; k < 4; k++) {
+    planes[k].ref = 0.0f;
+    planes[k].var = 0.01f;
+    planes[k].lastMs = 0;
+    planes[k].seeded = false;
+    planes[k].logRef = 0.0f;
+    wallPrevPlane[k] = -1;
+    wallAssocPlane[k] = -1;
+  }
+  wallHandoffCount = 0;
+  wallDropCount = 0;
 }
 
 void kalmanCoreUpdateWithWallFront(kalmanCoreData_t* this, tofMeasurement_t* tof, bool quadIsFlying)
 {
-  wallUpdate(this, tof, quadIsFlying, &frontWall);
+  if (mrWallsWorldPlanes) { wallUpdateWorld(this, tof, quadIsFlying, BEAM_FRONT); }
+  else                    { wallUpdate(this, tof, quadIsFlying, &frontWall); }
 }
 
 void kalmanCoreUpdateWithWallBack(kalmanCoreData_t* this, tofMeasurement_t* tof, bool quadIsFlying)
 {
-  wallUpdate(this, tof, quadIsFlying, &backWall);
+  if (mrWallsWorldPlanes) { wallUpdateWorld(this, tof, quadIsFlying, BEAM_BACK); }
+  else                    { wallUpdate(this, tof, quadIsFlying, &backWall); }
 }
 
 void kalmanCoreUpdateWithWallLeft(kalmanCoreData_t* this, tofMeasurement_t* tof, bool quadIsFlying)
 {
-  wallUpdate(this, tof, quadIsFlying, &leftWall);
+  if (mrWallsWorldPlanes) { wallUpdateWorld(this, tof, quadIsFlying, BEAM_LEFT); }
+  else                    { wallUpdate(this, tof, quadIsFlying, &leftWall); }
 }
 
 void kalmanCoreUpdateWithWallRight(kalmanCoreData_t* this, tofMeasurement_t* tof, bool quadIsFlying)
 {
-  wallUpdate(this, tof, quadIsFlying, &rightWall);
+  if (mrWallsWorldPlanes) { wallUpdateWorld(this, tof, quadIsFlying, BEAM_RIGHT); }
+  else                    { wallUpdate(this, tof, quadIsFlying, &rightWall); }
 }
 
 /**
@@ -429,6 +727,55 @@ PARAM_ADD(PARAM_FLOAT, cosMin, &wallRaycastCosMin)
  * 1/floorWMin.
  */
 PARAM_ADD(PARAM_FLOAT, floorWMin, &wallRaycastFloorWMin)
+/**
+ * @brief YAW-AWARE world-plane wall model: 0 = legacy body-locked (front->X, left->Y; the walls fade
+ * out under rotation); 1 = re-key the references to four world-fixed cardinal planes and associate
+ * each beam to a plane by the live yaw, so the absolute wall lock SURVIVES an in-place 360 rotation.
+ * Reduces byte-exact to the legacy path at yaw0/level.
+ */
+PARAM_ADD(PARAM_UINT8, worldPlanes, &mrWallsWorldPlanes)
+/**
+ * @brief World-plane grazing HARD-DROP: a beam whose incidence cosine g = n_k.u_xy is below this is
+ * skipped entirely (a perpendicular partner is rank-2 at 45deg, so a grazing beam loses no info).
+ */
+PARAM_ADD(PARAM_FLOAT, incCosMin, &wallIncCosMin)
+/**
+ * @brief World-plane re-association floor: force a re-association once the held plane's g drops below
+ * this (never hold a plane across its grazing knee).
+ */
+PARAM_ADD(PARAM_FLOAT, assocReevalG, &wallAssocReevalG)
+/**
+ * @brief World-plane association hysteresis: a competitor plane must beat the held plane's g by this
+ * margin to switch (kills 45deg chatter).
+ */
+PARAM_ADD(PARAM_FLOAT, assocHyst, &wallAssocHyst)
+/**
+ * @brief World-plane far-wall/doorway HARD-DROP: drop a beam whose position innovation exceeds this
+ * [m] (a re-association event, not a noisy hit).
+ */
+PARAM_ADD(PARAM_FLOAT, innovDrop, &wallInnovHardDropM)
+/**
+ * @brief World-plane offset-confidence: above this plane-offset variance [m^2] the update is
+ * offset-only (position rides flow/INS while the reference seeks the wall -- no snap on a handoff).
+ */
+PARAM_ADD(PARAM_FLOAT, uncVar, &wallUnconvergedVarM2)
+/**
+ * @brief World-plane jump-diffusion innovation band [m]: re-seat the offset only for an innovation
+ * inside [jumpLo, jumpHi] so a far-wall step cannot loosen the offset.
+ */
+PARAM_ADD(PARAM_FLOAT, jumpLo, &wallJumpBandLoM)
+PARAM_ADD(PARAM_FLOAT, jumpHi, &wallJumpBandHiM)
+/**
+ * @brief World-plane mrq QUALITY data-association: 1 = drop a beam the VL53L1x flags untrustworthy
+ * (bad status or signal below the floor) so a grazing beam self-drops at a crossover; 0 = pure
+ * geometry (the A/B baseline).
+ */
+PARAM_ADD(PARAM_UINT8, quality, &wallQuality)
+/**
+ * @brief World-plane quality signal floor [MCPS]: reject a wall return weaker than this (grazing /
+ * far / specular). Applied only when the sensor reports a signal.
+ */
+PARAM_ADD(PARAM_FLOAT, qSignalMin, &wallQSignalMin)
 PARAM_GROUP_STOP(zwall)
 
 /**
@@ -451,4 +798,15 @@ LOG_ADD(LOG_FLOAT, fInnov, &frontWall.logInnov) // front position innovation [m]
 LOG_ADD(LOG_FLOAT, lInnov, &leftWall.logInnov)  // left position innovation [m]
 LOG_ADD(LOG_FLOAT, xImplied, &wallXImplied)   // X the last-updated front/back wall implies [m]
 LOG_ADD(LOG_FLOAT, yImplied, &wallYImplied)   // Y the last-updated left/right wall implies [m]
+// world-plane diagnostics (mrWalls.worldPlanes = 1): the four world-fixed cardinal plane offsets,
+// the plane each beam is currently associated to (PLANE_PX/NX/PY/NY = 0/1/2/3, -1 = dropped), and
+// the cumulative handoff / hard-drop counts (clean handoffs = the front offset tracking +X -> +Y).
+LOG_ADD(LOG_FLOAT, dpx, &planes[PLANE_PX].logRef)   // +X plane offset [m]
+LOG_ADD(LOG_FLOAT, dnx, &planes[PLANE_NX].logRef)   // -X plane offset [m]
+LOG_ADD(LOG_FLOAT, dpy, &planes[PLANE_PY].logRef)   // +Y plane offset [m]
+LOG_ADD(LOG_FLOAT, dny, &planes[PLANE_NY].logRef)   // -Y plane offset [m]
+LOG_ADD(LOG_INT32, aFront, &wallAssocPlane[BEAM_FRONT]) // plane the front beam is on (-1 dropped)
+LOG_ADD(LOG_INT32, aLeft, &wallAssocPlane[BEAM_LEFT])   // plane the left beam is on
+LOG_ADD(LOG_UINT32, handoffs, &wallHandoffCount)        // cumulative beam->plane handoffs
+LOG_ADD(LOG_UINT32, drops, &wallDropCount)              // cumulative grazing/far-wall drops
 LOG_GROUP_STOP(zwall)
