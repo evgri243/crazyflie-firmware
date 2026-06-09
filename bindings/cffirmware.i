@@ -29,6 +29,8 @@
 #include "mm_tof.h"
 #include "mm_flow.h"
 #include "mm_distance.h"
+#include "mm_tof_walls.h"
+#include "mm_tof_surface.h"
 %}
 
 %include "math3d.h"
@@ -50,6 +52,8 @@
 %include "mm_tof.h"
 %include "mm_flow.h"
 %include "mm_distance.h"
+%include "mm_tof_walls.h"
+%include "mm_tof_surface.h"
 
 
 %inline %{
