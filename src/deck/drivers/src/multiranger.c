@@ -187,6 +187,8 @@ static void mrTask(void *param)
           front.timestamp = xTaskGetTickCount();
           front.distance = frontMm / 1000.0f;
           front.stdDev = (qFront.sigma > 0.0f) ? (qFront.sigma * 0.001f) : mrWallsStd;
+          front.signal = qFront.signal;   // return strength (MCPS) + status for the world-plane quality gate
+          front.status = qFront.status;   // (a grazing / edge / furniture hit self-reports here)
           estimatorEnqueueWallFront(&front);
         }
         uint16_t backMm = mrGetMeasurementAndRestart(&devBack, &qBack);
@@ -196,6 +198,8 @@ static void mrTask(void *param)
           back.timestamp = xTaskGetTickCount();
           back.distance = backMm / 1000.0f;
           back.stdDev = (qBack.sigma > 0.0f) ? (qBack.sigma * 0.001f) : mrWallsStd;
+          back.signal = qBack.signal;
+          back.status = qBack.status;
           estimatorEnqueueWallBack(&back);
         }
         uint16_t upMm = mrGetMeasurementAndRestart(&devUp, &qUp);
@@ -219,6 +223,8 @@ static void mrTask(void *param)
           left.timestamp = xTaskGetTickCount();
           left.distance = leftMm / 1000.0f;
           left.stdDev = (qLeft.sigma > 0.0f) ? (qLeft.sigma * 0.001f) : mrWallsStd;
+          left.signal = qLeft.signal;
+          left.status = qLeft.status;
           estimatorEnqueueWallLeft(&left);
         }
         uint16_t rightMm = mrGetMeasurementAndRestart(&devRight, &qRight);
@@ -228,6 +234,8 @@ static void mrTask(void *param)
           right.timestamp = xTaskGetTickCount();
           right.distance = rightMm / 1000.0f;
           right.stdDev = (qRight.sigma > 0.0f) ? (qRight.sigma * 0.001f) : mrWallsStd;
+          right.signal = qRight.signal;
+          right.status = qRight.status;
           estimatorEnqueueWallRight(&right);
         }
     }
