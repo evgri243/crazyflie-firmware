@@ -31,6 +31,7 @@
 #include "mm_distance.h"
 #include "mm_tof_walls.h"
 #include "mm_tof_surface.h"
+#include "mm_zupt.h"
 %}
 
 %include "math3d.h"
@@ -54,6 +55,7 @@
 %include "mm_distance.h"
 %include "mm_tof_walls.h"
 %include "mm_tof_surface.h"
+%include "mm_zupt.h"
 
 
 %inline %{

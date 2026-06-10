@@ -57,6 +57,7 @@ fw_sources = [
     "src/modules/src/kalman_core/mm_distance.c",
     "src/modules/src/kalman_core/mm_tof_surface.c",
     "src/modules/src/kalman_core/mm_tof_walls.c",
+    "src/modules/src/kalman_core/mm_zupt.c",
 ]
 
 cffirmware = Extension(
